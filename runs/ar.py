@@ -6,6 +6,7 @@ from models.utils import Config, Int8QuantHandler, WeightOnlyInt4QuantHandler, g
 from typing import Optional
 from torch import Tensor
 from pathlib import Path
+from transformers import AutoTokenizer
 
 
 default_device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -36,8 +37,8 @@ def load_model(config_path: Path, checkpoint_path: Path, quantize: Optional[str]
 
 def decode_one_token(model: nn.Module, prompt: Tensor, temperature: float, top_k: int, top_p: float):
     logits = model(prompt)
-    logits = norm_logits(logits[:, -1:, :], temperature, top_k=top_k, top_p=top_p)
-    next_token = sample(logits)
+    probs = norm_logits(logits[:, -1:, :], temperature, top_k=top_k, top_p=top_p)
+    next_token = sample(probs)
 
     return next_token
 
@@ -63,13 +64,22 @@ def generate(model: nn.Module, prompt: Tensor, max_new_tokens: int, eos_id: int,
 
 def main(prompt: str, max_new_tokens: int, config_path: Path, checkpoint_path: Path, num_samples: int = 3,
          quantize: Optional[str] = None, use_cache: bool = False, device: str = default_device, temperature: float = 1., top_k: int = 0,
-         top_p: float = 0., dialogue: bool = False, system_prompt: str = 'You are a helpful AI assistant'):
+         top_p: float = 0., dialogue: bool = False, system_prompt: str = 'You are a helpful assistant.'):
     model = load_model(config_path, checkpoint_path, quantize, device)
-
     device_sync(device)
 
-    tokenizer = get_tokenizer(checkpoint_path.parent, dialogue=dialogue, system_prompt=system_prompt)
-    prompt = tokenizer.encode(prompt).to(device).view(1, -1)
+    tokenizer = AutoTokenizer.from_pretrained(checkpoint_path.parent)
+    if dialogue:
+        messages = [
+            {'role': 'system', 'content': system_prompt},
+            {'role': 'user', 'content': prompt}
+        ]
+        prompt = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+    prompt = tokenizer([prompt], return_tensors='pt')['input_ids'].to(device)
 
     outputs = []
     for i in range(num_samples):
@@ -78,14 +88,14 @@ def main(prompt: str, max_new_tokens: int, config_path: Path, checkpoint_path: P
             model,
             prompt=prompt,
             max_new_tokens=max_new_tokens,
-            eos_id=tokenizer.eot_id() if dialogue else tokenizer.eos_id(),
+            eos_id=tokenizer.convert_tokens_to_ids("<|eot_id|>") if dialogue else tokenizer.eos_token_id,
             use_cache=use_cache,
             temperature=temperature,
             top_k=top_k,
             top_p=top_p
         )
         device_sync(device)
-        output_text = tokenizer.decode(output_ids[0].tolist())
+        output_text = tokenizer.decode(output_ids[0])
         outputs.append(output_text)
         print('-----------------------------------------')
         print(output_text)

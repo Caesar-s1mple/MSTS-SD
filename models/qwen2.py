@@ -6,7 +6,7 @@ from torch import Tensor
 from .utils import Config
 
 
-class LLaMA(nn.Module):
+class Qwen2(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
         self.config = config
@@ -101,7 +101,7 @@ class GroupedMultiQueryAttention(nn.Module):
         self.num_kv_heads = config.num_kv_heads
         self.kv_dim = self.head_dim * self.num_kv_heads
 
-        self.linear_qkv = nn.Linear(self.embedding_dim, self.embedding_dim + 2 * self.kv_dim, bias=False)
+        self.linear_qkv = nn.Linear(self.embedding_dim, self.embedding_dim + 2 * self.kv_dim)
 
         self.linear = nn.Linear(self.embedding_dim, self.embedding_dim, bias=False)
 
@@ -110,11 +110,29 @@ class GroupedMultiQueryAttention(nn.Module):
         self._register_load_state_dict_pre_hook(self.load_hook)
 
     def load_hook(self, state_dict, prefix, *args):
+        def permute_weight(weight, n_head):
+            return (
+                weight.view(n_head, 2, self.head_dim // 2, self.embedding_dim)
+                .transpose(1, 2)
+                .reshape(self.head_dim * n_head, self.embedding_dim)
+            )
+
+        def permute_bias(weight, n_head):
+            return (
+                weight.view(n_head, 2, self.head_dim // 2)
+                .transpose(1, 2)
+                .reshape(self.head_dim * n_head)
+            )
+
         if prefix + 'linear_q.weight' in state_dict:
             wq = state_dict.pop(prefix + 'linear_q.weight')
             wk = state_dict.pop(prefix + 'linear_k.weight')
             wv = state_dict.pop(prefix + 'linear_v.weight')
+            bq = state_dict.pop(prefix + 'linear_q.bias')
+            bk = state_dict.pop(prefix + 'linear_k.bias')
+            bv = state_dict.pop(prefix + 'linear_v.bias')
             state_dict[prefix + 'linear_qkv.weight'] = torch.cat([wq, wk, wv])
+            state_dict[prefix + 'linear_qkv.bias'] = torch.cat([bq, bk, bv])
         if prefix + 'linear_q.scales' in state_dict:
             scale_q = state_dict.pop(prefix + 'linear_q.scales')
             scale_k = state_dict.pop(prefix + 'linear_k.scales')
@@ -144,7 +162,7 @@ class GroupedMultiQueryAttention(nn.Module):
         attention_score = query @ key.transpose(-2, -1) / math.sqrt(self.head_dim)
         attention_score.masked_fill_(~attention_mask, -torch.inf)
 
-        attention_score = torch.softmax(attention_score, dim=-1)
+        attention_score = torch.softmax(attention_score, dim=-1, dtype=torch.float32).type_as(query)
         output = attention_score @ value
         output = output.transpose(1, 2).contiguous().view(bs, seq_len, self.embedding_dim)
 
@@ -209,12 +227,12 @@ def apply_rope_scaling(freqs: Tensor, rope_scaling: Optional[dict] = None):
 
 def precompute_freqs_cis(max_seq_len: int, dim: int, base: int = 10000, dtype: torch.dtype = torch.bfloat16,
                          rope_scaling: Optional[dict] = None) -> Tensor:
-    freqs = 1. / (base ** (torch.arange(0, dim, 2).float() / dim))
+    inv_freq = 1. / (base ** (torch.arange(0, dim, 2).float() / dim))
     if rope_scaling is not None:
-        freqs = apply_rope_scaling(freqs, rope_scaling)
+        inv_freq = apply_rope_scaling(inv_freq, rope_scaling)
     position = torch.arange(0, max_seq_len, dtype=torch.float)
-    # position -> max_seq_len, 1  freqs -> dim / 2
-    freqs = torch.outer(position, freqs)
+    # position -> max_seq_len, 1  inv_freq -> dim / 2
+    freqs = torch.outer(position, inv_freq)
     freqs_cis = torch.stack([freqs.cos(), freqs.sin()], dim=-1)
     return freqs_cis.to(dtype=dtype)  # max_seq_len, dim // 2, 2
 
@@ -235,4 +253,3 @@ def apply_rotate_emb(x: Tensor, freqs_cis):
     x_out = torch.cat((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1)
 
     return x_out.type_as(x)
-

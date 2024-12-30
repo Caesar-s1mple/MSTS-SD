@@ -29,12 +29,12 @@ def norm_logits(logits: Tensor, temperature: float = 1, top_k: int = 0, top_p: f
         logits[logits < filter.select(-1, -1).unsqueeze(-1)] = -torch.inf
 
     if top_p > 0.:
-        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+        sorted_logits, sorted_indices = torch.sort(logits, dim=-1, descending=True)
         cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
         filter = cumulative_probs > top_p
         filter[..., 1:] = filter[..., :-1].clone()
         filter[..., 0] = 0
-        indices_to_remove = filter.scatter(1, sorted_indices, filter)
+        indices_to_remove = filter.scatter(-1, sorted_indices, filter)
         logits[indices_to_remove] = -torch.inf
 
     probs = F.softmax(logits, dim=-1)

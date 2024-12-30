@@ -125,20 +125,6 @@ class MultiheadAttention(nn.Module):
         self._register_load_state_dict_pre_hook(self.load_hook)
 
     def load_hook(self, state_dict, prefix, *args):
-        def permute_weight(weight, n_head):
-            return (
-                weight.view(n_head, 2, self.head_dim // 2, self.embedding_dim)
-                .transpose(1, 2)
-                .reshape(self.head_dim * n_head, self.embedding_dim)
-            )
-
-        def permute_bias(weight, n_head):
-            return (
-                weight.view(n_head, 2, self.head_dim // 2)
-                .transpose(1, 2)
-                .reshape(self.head_dim * n_head)
-            )
-
         if prefix + 'linear_q.weight' in state_dict:
             wq = state_dict.pop(prefix + 'linear_q.weight')
             wk = state_dict.pop(prefix + 'linear_k.weight')
@@ -168,8 +154,6 @@ class MultiheadAttention(nn.Module):
 
         # query_rot -> bs, num_heads, seq_len, rotary_dim
         # freqs_cis -> seq_len, head_dim / 2, 2
-
-        print(query_rot.shape, freqs_cis.shape)
         query_rot = apply_rotate_emb(query_rot, freqs_cis)
         key_rot = apply_rotate_emb(key_rot, freqs_cis)
 
@@ -244,13 +228,14 @@ def precompute_freqs_cis(max_seq_len: int, dim: int, base: int = 10000, dtype: t
 
 
 def apply_rotate_emb(x: Tensor, freqs_cis):
-    xshaped = x.float().reshape(*x.shape[:-1], -1, 2)  # bs, num_heads, seq_len, dim / 2, 2
-    x_out2 = torch.stack(
-        [
-            xshaped[..., 0] * freqs_cis[..., 0] - xshaped[..., 1] * freqs_cis[..., 1],
-            xshaped[..., 1] * freqs_cis[..., 0] + xshaped[..., 0] * freqs_cis[..., 1]
-        ],
-        dim=-1
-    )
-    x_out2 = x_out2.flatten(3)  # bs, seq_len, num_heads, dim
-    return x_out2.type_as(x)
+    # x -> bs, num_heads, seq_len, dim
+    # freqs_cis -> seq_len, dim // 2, 2
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2:]
+
+    cos = freqs_cis[..., 0]  # seq_len, dim // 2
+    sin = freqs_cis[..., 1]  # seq_len, dim // 2
+
+    x_out = torch.cat((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1)
+
+    return x_out.type_as(x)

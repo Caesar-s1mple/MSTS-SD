@@ -6,6 +6,7 @@ from models.utils import Config, Int8QuantHandler, WeightOnlyInt4QuantHandler, g
 from typing import Optional
 from torch import Tensor
 from pathlib import Path
+from transformers import AutoTokenizer
 
 default_device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -35,17 +36,30 @@ def load_model(config_path: Path, checkpoint_path: Path, quantize: Optional[str]
 
 def draft_one_token(model: nn.Module, prompt: Tensor, temperature: float, top_k: int, top_p: float):
     logits = model(prompt)
-    logits = norm_logits(logits, temperature, top_k=top_k, top_p=top_p)
-    next_token = sample(logits[:, -1, :])
+    probs = norm_logits(logits, temperature, top_k=top_k, top_p=top_p)
+    next_token = sample(probs[:, -1, :])
 
-    return next_token, logits
+    return next_token, probs
 
 
 def verify_tokens(model: nn.Module, prompt: Tensor, temperature: float, top_k: int, top_p: float):
     logits = model(prompt)
-    logits = norm_logits(logits, temperature, top_k=top_k, top_p=top_p)
+    probs = norm_logits(logits, temperature, top_k=top_k, top_p=top_p)
 
-    return logits
+    return probs
+
+
+def rollback(model: nn.Module, prob_history, end_position: int):
+    for layer in model.layers:
+        k_cache = layer.self_attn.kv_cache.k_cache  # bs, num_kv_heads, cached_len, head_dim
+        v_cache = layer.self_attn.kv_cache.v_cache
+        k_cache = k_cache[:, :, :end_position + 1, :]
+        v_cache = v_cache[:, :, :end_position + 1, :]
+        layer.self_attn.kv_cache.k_cache = k_cache
+        layer.self_attn.kv_cache.v_cache = v_cache
+
+    prob_history = prob_history[:, :end_position + 1, :]
+    return prob_history
 
 
 @torch.no_grad()
@@ -57,7 +71,7 @@ def generate(target_model: nn.Module, draft_model: nn.Module, prompt: Tensor, ma
 
     device = prompt.device
     with torch.device(device):
-        target_model.setup_caches(max_seq_len=min(T_new, target_model.config.max_seq_len), use_cache=use_cache)
+        target_model.setup_caches(max_seq_len=min(T_new + gamma - 1, target_model.config.max_seq_len), use_cache=use_cache)
 
     with torch.device(device):
         draft_model.setup_caches(max_seq_len=min(T_new + gamma - 1, draft_model.config.max_seq_len), use_cache=use_cache)
@@ -73,43 +87,52 @@ def generate(target_model: nn.Module, draft_model: nn.Module, prompt: Tensor, ma
         prefix_len = prompt.size(-1)
         for _ in range(gamma):
             next_token, prob = draft_one_token(draft_model, prompt, temperature, top_k, top_p)
-            if draft_prob_history is None:
-                draft_prob_history = prob
+            if use_cache:
+                if draft_prob_history is None:
+                    draft_prob_history = prob
+                else:
+                    draft_prob_history = torch.cat([draft_prob_history, prob], dim=1)
             else:
-                draft_prob_history = torch.cat([draft_prob_history, prob], dim=1)
+                draft_prob_history = prob
             prompt = torch.cat([prompt, next_token], dim=-1)
 
         prob = verify_tokens(target_model, prompt, temperature, top_k, top_p)
-        if target_prob_history is None:
-            target_prob_history = prob
+        if use_cache:
+            if target_prob_history is None:
+                target_prob_history = prob
+            else:
+                target_prob_history = torch.cat([target_prob_history, prob], dim=1)
         else:
-            target_prob_history = torch.cat([target_prob_history, prob], dim=1)
+            target_prob_history = prob
 
         n = prefix_len + gamma - 1
         for i in range(gamma):
             r = torch.rand(1, device=device)
             j = prompt[:, prefix_len + i]
-            if r > (target_prob_history[:, prefix_len + i - 1, j]) / (draft_prob_history[:, prefix_len + i - 1, j]):
+            if r > (target_prob_history[:, prefix_len + i - 1, j] / draft_prob_history[:, prefix_len + i - 1, j]):
                 n = prefix_len + i - 1
                 break
 
             draft_token_cnt += 1
             if j == eos_id:
                 n = prefix_len + i
-                eos = T
+                eos = True
                 break
 
         prompt = prompt[:, :n + 1]
-        draft_model.rollback(n)
+        if use_cache:
+            draft_prob_history = rollback(draft_model, draft_prob_history, n)
         if eos:
             break
         if n < prefix_len + gamma - 1:
             t = sample(norm_max(target_prob_history[:, n, :], draft_prob_history[:, n, :]))
-            target_model.rollback(n)
+            if use_cache:
+                target_prob_history = rollback(target_model, target_prob_history, n)
             resample_token_cnt += 1
         else:
-            t = sample(target_prob_history[:, -1, :])
-            target_model.rollback(n + 1)
+            t = sample(target_prob_history[:, n, :])
+            if use_cache:
+                target_prob_history = rollback(target_model, target_prob_history, n + 1)
             target_token_cnt += 1
 
         prompt = torch.cat([prompt, t], dim=-1)
@@ -123,7 +146,7 @@ def main(prompt: str, max_new_tokens: int, config_path: Path, checkpoint_path: P
          draft_checkpoint_path: Path, num_samples: int = 3,
          quantize: Optional[str] = None, draft_quantize: Optional[str] = None, gamma: int = 3, use_cache: bool = False,
          device: str = default_device, temperature: float = 1., top_k: int = 0,
-         top_p: float = 0., dialogue: bool = False):
+         top_p: float = 0., dialogue: bool = False, system_prompt: str = 'You are a helpful assistant.'):
     target_model = load_model(config_path, checkpoint_path, quantize, device)
     draft_model = load_model(draft_config_path, draft_checkpoint_path, draft_quantize, device)
 
@@ -131,8 +154,18 @@ def main(prompt: str, max_new_tokens: int, config_path: Path, checkpoint_path: P
 
     device_sync(device)
 
-    tokenizer = get_tokenizer(checkpoint_path.parent / 'tokenizer.model', model_name='llama-3')
-    prompt = tokenizer.encode(prompt).to(device).view(1, -1)
+    tokenizer = AutoTokenizer.from_pretrained(checkpoint_path.parent)
+    if dialogue:
+        messages = [
+            {'role': 'system', 'content': system_prompt},
+            {'role': 'user', 'content': prompt}
+        ]
+        prompt = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+    prompt = tokenizer([prompt], return_tensors='pt')['input_ids'].to(device)
 
     outputs = []
     for i in range(num_samples):
@@ -143,26 +176,17 @@ def main(prompt: str, max_new_tokens: int, config_path: Path, checkpoint_path: P
             prompt=prompt,
             max_new_tokens=max_new_tokens,
             gamma=gamma,
-            eos_id=tokenizer.eos_id(),
+            eos_id=tokenizer.convert_tokens_to_ids("<|eot_id|>") if dialogue else tokenizer.eos_token_id,
             use_cache=use_cache,
             temperature=temperature,
             top_k=top_k,
             top_p=top_p
         )
         device_sync(device)
-        output_text = tokenizer.decode(output_ids[0].tolist())
+        output_text = tokenizer.decode(output_ids[0])
         outputs.append(output_text)
+        print('-----------------------------------------')
         print(output_text)
+        print('-----------------------------------------')
 
     return outputs
-
-
-if __name__ == '__main__':
-    main(prompt='Hello, my name is',
-         max_new_tokens=200,
-         config_path=Path('../models/config/llama-3-8b.json'),
-         checkpoint_path=Path('../checkpoints/Meta-Llama-3-8B/convert/model_int8.pth'),
-         num_samples=5,
-         quantize='int8',
-         use_cache=True,
-         device='cuda:0')
